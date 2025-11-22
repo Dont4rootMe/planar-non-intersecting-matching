@@ -140,8 +140,26 @@ def plot_matching(
 
 if __name__ == "__main__":
     n_points = 15
-    A = np.random.rand(n_points, 2)
-    B = np.random.rand(n_points, 2)
+    # A = np.random.rand(n_points, 2)
+    # B = np.random.rand(n_points, 2)
+
+    A, B = [], []
+    with open('points.txt') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 3:
+                continue
+            x, y, cl = float(parts[0]), float(parts[1]), int(parts[2])
+            if cl == 0:
+                A.append((x, y))
+            elif cl == 1:
+                B.append((x, y))
+
+    A = np.stack(A, axis=0)
+    B = np.stack(B, axis=0)
+
+    # A = np.stack([np.arange(n_points)[::-1], np.ones(n_points,)], axis=1)
+    # B = np.stack([np.arange(n_points), np.zeros(n_points,)], axis=1)
 
     try:
         result_pairs = solve_complete_matching_robust(A, B)
