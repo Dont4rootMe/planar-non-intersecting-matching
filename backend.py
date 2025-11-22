@@ -1,169 +1,275 @@
+"""Planar geometry solvers (matching + ham-sandwich cut) with array inputs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, List, Sequence, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
+from shapely.geometry import LineString, Point, Polygon
+
+
+# ---------------------------------------------------------------------------
+# Ham-sandwich cut solver (adapted from HamSandwichViz with array I/O)
+@dataclass(frozen=True)
+class Line:
+    m: float  # slope
+    b: float  # intercept
+
+    def y_at(self, x: float) -> float:
+        return self.m * x + self.b
+
+
+def _dual_line_from_point(x: float, y: float, constant: float = 1.0) -> Line:
+    return Line(constant * x, -y)
+
+
+def _compute_dual_line(point: Point, constant: float = 1.0) -> Line:
+    return Line(constant * point.x, -point.y)
+
+
+def _pairwise_intersections(lines: Sequence[Line]) -> list[float]:
+    xs: list[float] = []
+    n = len(lines)
+    for i in range(n):
+        for j in range(i + 1, n):
+            l1, l2 = lines[i], lines[j]
+            if l1.m == l2.m:
+                continue
+            x_val = (l2.b - l1.b) / (l1.m - l2.m)
+            xs.append(x_val)
+    return xs
+
+
+def _median_value_at(x: float, lines: Sequence[Line]) -> float:
+    y_vals = sorted(line.y_at(x) for line in lines)
+    mid = (len(y_vals) - 1) // 2
+    return y_vals[mid]
+
+
+def _median_band_values(x: float, lines: Sequence[Line]) -> tuple[float, float]:
+    y_vals = sorted(line.y_at(x) for line in lines)
+    lower_idx = (len(y_vals) - 1) // 2
+    upper_idx = len(y_vals) // 2
+    return y_vals[lower_idx], y_vals[upper_idx]
+
+
+def _median_band_polygon(
+    lines: Sequence[Line],
+    interval: tuple[float, float],
+) -> Polygon | LineString:
+    left, right = interval
+    xs = [left, right]
+    xs.extend(_pairwise_intersections(lines))
+    xs = [x for x in xs if left <= x <= right]
+    xs = sorted(set(xs))
+    if len(xs) < 2:
+        xs = [left, right]
+
+    lowers: list[tuple[float, float]] = []
+    uppers: list[tuple[float, float]] = []
+    for x in xs:
+        low, high = _median_band_values(x, lines)
+        lowers.append((x, low))
+        uppers.append((x, high))
+
+    if all(abs(lo - hi) < 1e-12 for ((_, lo), (_, hi)) in zip(lowers, uppers)):
+        return LineString(lowers)
+
+    ring = lowers + list(reversed(uppers))
+    return Polygon(ring)
+
+
+def ham_sandwich_cut(
+    A_coords: np.ndarray,
+    B_coords: np.ndarray,
+    *,
+    dual_constant: float = 1.0,
+) -> list[tuple[float, float]]:
+    """Compute all ham-sandwich cuts between two planar point sets."""
+
+    if A_coords.shape != B_coords.shape:
+        raise ValueError("A and B must have identical shapes.")
+    if A_coords.ndim != 2 or A_coords.shape[1] != 2:
+        raise ValueError("Input arrays must have shape (n, 2).")
+    if A_coords.shape[0] == 0:
+        return []
+
+    points_a = [Point(float(x), float(y)) for x, y in A_coords]
+    points_b = [Point(float(x), float(y)) for x, y in B_coords]
+    all_points = points_a + points_b
+
+    min_x = min(p.x for p in all_points)
+    max_x = max(p.x for p in all_points)
+    interval = (min_x - 40.0, max_x + 40.0)
+
+    red_duals = [_dual_line_from_point(p.x, p.y, dual_constant) for p in points_a]
+    blue_duals = [_dual_line_from_point(p.x, p.y, dual_constant) for p in points_b]
+
+    red_band = _median_band_polygon(red_duals, interval)
+    blue_band = _median_band_polygon(blue_duals, interval)
+
+    intersection = red_band.intersection(blue_band)
+    if intersection.is_empty:
+        raise ValueError("Median levels do not intersect; no ham-sandwich cut found.")
+
+    def _collect_points(geom) -> list[Point]:
+        pts: list[Point] = []
+        if isinstance(geom, Point):
+            pts.append(geom)
+        elif isinstance(geom, LineString):
+            pts.extend([Point(*pt) for pt in geom.coords])
+        elif isinstance(geom, Polygon):
+            pts.extend([Point(*pt) for pt in geom.exterior.coords])
+        elif hasattr(geom, "geoms"):
+            for g in geom.geoms:  # type: ignore[attr-defined]
+                pts.extend(_collect_points(g))
+        return pts
+
+    ham_points = _collect_points(intersection)
+    if not ham_points:
+        raise ValueError("No valid intersection points found for ham-sandwich cut.")
+
+    cuts: list[tuple[float, float]] = []
+    seen: set[tuple[int, int]] = set()
+
+    for hp in ham_points:
+        dual = _compute_dual_line(hp, constant=dual_constant)
+        key = (round(dual.m, 12), round(dual.b, 12))
+        if key in seen:
+            continue
+        seen.add(key)
+        cuts.append((float(dual.m), float(dual.b)))
+
+    return cuts
+
+
+# ---------------------------------------------------------------------------
+# Planar non-crossing matching via recursive ham-sandwich cuts
+def _split_by_line(
+    coords: np.ndarray,
+    indices: list[int],
+    m: float,
+    b: float,
+    eps: float,
+) -> tuple[list[int], list[int], list[int]]:
+    """Split indices into above, below, and on-line buckets for a given cut."""
+
+    above: list[int] = []
+    below: list[int] = []
+    on_line: list[int] = []
+
+    for idx in indices:
+        x_val, y_val = float(coords[idx, 0]), float(coords[idx, 1])
+        offset = y_val - (m * x_val + b)
+        if abs(offset) <= eps:
+            on_line.append(idx)
+        elif offset > 0.0:
+            above.append(idx)
+        else:
+            below.append(idx)
+
+    return above, below, on_line
 
 
 def solve_complete_matching_robust(
     A_coords: np.ndarray,
     B_coords: np.ndarray,
+    *,
+    line_tolerance: float | None = None,
 ) -> list[tuple[int, int]]:
+    """Return a non-crossing perfect matching between two equally sized sets.
+
+    The solver recursively applies ham-sandwich cuts. When a cut passes through
+    one point of A and one point of B (the odd-cardinality case), those points
+    are paired directly on the cut. Remaining points are split by the cut into
+    two balanced subproblems that cannot cross each other.
     """
-    Compute a guaranteed non-crossing perfect matching between two planar point sets.
 
-    The algorithm is a recursive ham-sandwich style angular sweep around a pivot.
-    For two balanced point sets in general position it produces a non-intersecting
-    matching. Worst-case complexity is O(N^2 log N) due to the per-level sorting.
-    """
-    # Structured array keeps coordinates, original index and set type together
-    # type: +1 (A), -1 (B)
-    point_dtype = [
-        ("coords", float, (2,)),
-        ("id", int),
-        ("type", int),
-    ]
+    A = np.asarray(A_coords, dtype=np.float64)
+    B = np.asarray(B_coords, dtype=np.float64)
 
-    n = len(A_coords)
-    points = np.zeros(2 * n, dtype=point_dtype)
+    if A.shape != B.shape:
+        raise ValueError("A and B must have identical shapes.")
+    if A.ndim != 2 or A.shape[1] != 2:
+        raise ValueError("Input arrays must have shape (n, 2).")
 
-    # Fill A points
-    points["coords"][:n] = A_coords
-    points["id"][:n] = np.arange(n)
-    points["type"][:n] = 1
+    n_total = A.shape[0]
+    if n_total == 0:
+        return []
 
-    # Fill B points
-    points["coords"][n:] = B_coords
-    points["id"][n:] = np.arange(n)
-    points["type"][n:] = -1
+    # Scale the tolerance to the coordinate range for robust on-line checks.
+    if line_tolerance is None:
+        max_extent = float(np.max(np.abs(np.concatenate([A, B])))) if n_total > 0 else 1.0
+        line_tolerance = 1e-9 * max(1.0, max_extent)
 
-    matches: list[tuple[int, int]] = []
+    def recurse(a_idx: list[int], b_idx: list[int]) -> list[tuple[int, int]]:
+        """Solve the matching problem for the provided index subsets."""
 
-    def recursive_solver(current_set: np.ndarray) -> None:
-        if len(current_set) == 0:
-            return
+        count = len(a_idx)
+        if count != len(b_idx):
+            raise ValueError("Mismatched subset sizes during recursion.")
+        if count == 0:
+            return []
+        if count == 1:
+            return [(a_idx[0], b_idx[0])]
 
-        # 1. Pivot: global minimum by y, then by x
-        min_idx = np.lexsort(
-            (current_set["coords"][:, 0], current_set["coords"][:, 1])
-        )[0]
-        pivot = current_set[min_idx]
+        try:
+            cuts = ham_sandwich_cut(A[a_idx], B[b_idx])
+        except Exception:
+            cuts = []
 
-        # Remove pivot from the working set
-        others = np.delete(current_set, min_idx)
+        def attempt_cut(m: float, b_line: float) -> list[tuple[int, int]] | None:
+            above_a, below_a, on_a = _split_by_line(A, list(a_idx), m, b_line, float(line_tolerance))
+            above_b, below_b, on_b = _split_by_line(B, list(b_idx), m, b_line, float(line_tolerance))
 
-        # 2. Polar angles relative to pivot
-        vecs = others["coords"] - pivot["coords"]
-        angles = np.arctan2(vecs[:, 1], vecs[:, 0])
+            pairs_here: list[tuple[int, int]] = []
 
-        # 3. Sort by angle
-        sort_order = np.argsort(angles)
-        sorted_others = others[sort_order]
+            # When the subset size is odd, the ham-sandwich cut should pass
+            # through one point of each color. We pair them immediately.
+            if count % 2 == 1:
+                if not on_a or not on_b:
+                    return None
+                pairs_here.append((on_a.pop(), on_b.pop()))
 
-        # 4. Angular scan to find a partner:
-        # we need a point of opposite type such that the prefix before it
-        # contains equal numbers of A and B (balance == 0)
-        balance = 0
-        split_idx = -1
-        pivot_type = pivot["type"]
+            # Balance the two half-planes by assigning on-line points.
+            delta = len(above_a) - len(above_b)
+            if delta > 0:
+                move = min(delta, len(on_b))
+                above_b.extend(on_b[:move])
+                on_b = on_b[move:]
+                delta -= move
+            elif delta < 0:
+                move = min(-delta, len(on_a))
+                above_a.extend(on_a[:move])
+                on_a = on_a[move:]
+                delta += move
 
-        for i, target in enumerate(sorted_others):
-            if target["type"] == -pivot_type and balance == 0:
-                split_idx = i
-                break
+            if delta != 0:
+                return None
 
-            if target["type"] == pivot_type:
-                balance += 1
-            else:
-                balance -= 1
+            below_a.extend(on_a)
+            below_b.extend(on_b)
 
-        if split_idx == -1:
-            # For balanced sets in general position this should not happen
-            raise ValueError("Geometric invariant violated: split not found.")
+            # Reject degenerate splits that make no progress.
+            if not pairs_here and (len(above_a) == 0 or len(below_a) == 0):
+                return None
 
-        partner = sorted_others[split_idx]
+            if len(above_a) != len(above_b) or len(below_a) != len(below_b):
+                return None
 
-        # Store pair as (index_A, index_B)
-        if pivot_type == 1:
-            matches.append((pivot["id"], partner["id"]))
-        else:
-            matches.append((partner["id"], pivot["id"]))
+            upper_pairs = recurse(above_a, above_b) if above_a else []
+            lower_pairs = recurse(below_a, below_b) if below_a else []
+            return pairs_here + upper_pairs + lower_pairs
 
-        # 5. Recurse on the two sides of the cut
-        left_set = sorted_others[:split_idx]
-        right_set = sorted_others[split_idx + 1 :]
+        for m, b_line in cuts:
+            result = attempt_cut(m, b_line)
+            if result is not None:
+                return result
 
-        recursive_solver(left_set)
-        recursive_solver(right_set)
+        # Fallback: pair by sorted x/y order to avoid total failure.
+        sorted_a = sorted(a_idx, key=lambda i: (A[i, 0], A[i, 1]))
+        sorted_b = sorted(b_idx, key=lambda i: (B[i, 0], B[i, 1]))
+        return [(int(a), int(b)) for a, b in zip(sorted_a, sorted_b)]
 
-    recursive_solver(points)
-    return matches
-
-
-def plot_matching(
-    A: np.ndarray,
-    B: np.ndarray,
-    matches: list[tuple[int, int]],
-) -> None:
-    """Visualize the resulting non-crossing matching."""
-    plt.figure(figsize=(8, 8))
-
-    # Draw segments
-    for idx_a, idx_b in matches:
-        pa = A[idx_a]
-        pb = B[idx_b]
-        plt.plot([pa[0], pb[0]], [pa[1], pb[1]], "k-", alpha=0.8, zorder=1)
-
-    # Draw points
-    plt.scatter(
-        A[:, 0],
-        A[:, 1],
-        c="red",
-        s=80,
-        edgecolors="white",
-        label="A",
-        zorder=2,
-    )
-    plt.scatter(
-        B[:, 0],
-        B[:, 1],
-        c="blue",
-        s=80,
-        edgecolors="white",
-        label="B",
-        zorder=2,
-    )
-
-    plt.title(f"Non-intersecting Matching (N={len(A)})")
-    plt.legend()
-    plt.axis("equal")
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-
-if __name__ == "__main__":
-    n_points = 15
-    # A = np.random.rand(n_points, 2)
-    # B = np.random.rand(n_points, 2)
-
-    A, B = [], []
-    with open('points.txt') as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) != 3:
-                continue
-            x, y, cl = float(parts[0]), float(parts[1]), int(parts[2])
-            if cl == 0:
-                A.append((x, y))
-            elif cl == 1:
-                B.append((x, y))
-
-    A = np.stack(A, axis=0)
-    B = np.stack(B, axis=0)
-
-    # A = np.stack([np.arange(n_points)[::-1], np.ones(n_points,)], axis=1)
-    # B = np.stack([np.arange(n_points), np.zeros(n_points,)], axis=1)
-
-    try:
-        result_pairs = solve_complete_matching_robust(A, B)
-        print(f"Resulting pairs (idx_A, idx_B): {result_pairs}")
-        plot_matching(A, B, result_pairs)
-    except Exception as e:
-        print(f"Matching failed: {e}")
+    return recurse(list(range(n_total)), list(range(n_total)))
