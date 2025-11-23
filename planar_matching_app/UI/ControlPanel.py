@@ -50,9 +50,9 @@ class ControlPanel(QWidget):
         
         # Synthetic dataset controls
         self._n_points_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self._n_points_slider.setRange(15, 100)
-        self._n_points_slider.setValue(100)
-        self._n_points_label = QLabel("Points per class: 100", self)
+        self._n_points_slider.setRange(15, 300)
+        self._n_points_slider.setValue(50)
+        self._n_points_label = QLabel("Points per class: 50", self)
         
         self._noise_slider = QSlider(Qt.Orientation.Horizontal, self)
         self._noise_slider.setRange(0, 20)  # 0-2.0 with 0.01 precision
