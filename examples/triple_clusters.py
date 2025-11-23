@@ -92,6 +92,8 @@ def get_triple_clusters(
     """
     if noise <= 0.001:
         noise = 0.4
+
+    noise = noise * 2
     
     centers = _equilateral_triangle_centers(side=side, angle_deg=angle_deg)
 

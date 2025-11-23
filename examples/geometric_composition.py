@@ -75,6 +75,8 @@ def get_nested_polygons(
     if noise <= 0.001:
         noise = 0.3
     noise = noise / 10.0
+
+    noise = noise * 7
     
     sigma_radial = noise
     
@@ -236,6 +238,8 @@ def get_spirals(
         noise = 0.2
     
     noise = noise / 5.0
+
+    noise = noise * 4
     
     rng = np.random.default_rng(random_state)
     
